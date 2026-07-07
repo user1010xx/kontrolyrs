@@ -1,0 +1,11 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+~$*.xlsx
+terminals/
+_audit.py
+_analyze.py
+_test_logic.py
+_verify.py
+*.xlsx
