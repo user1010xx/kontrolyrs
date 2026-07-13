@@ -222,6 +222,37 @@ def _yatirim_sayisi(kayit: datetime, yatirim: datetime | None) -> int:
     return 1 if yatirim <= deadline else 0
 
 
+def _series_to_datetime(series: pd.Series) -> pd.Series:
+    """Bulk-parse mixed Excel date cells to timezone-naive datetimes."""
+    if series is None or series.empty:
+        return pd.Series(dtype="datetime64[ns]")
+
+    # Fast path for true datetime cells / ISO-ish strings
+    converted = pd.to_datetime(series, dayfirst=True, errors="coerce")
+
+    # Retry rows that stayed NaT but had a value (custom formats / serials)
+    try:
+        still_missing = converted.isna() & series.notna()
+    except Exception:
+        still_missing = converted.isna()
+
+    if still_missing.any():
+        repaired = series.loc[still_missing].map(_parse_datetime)
+        # map may return python datetime objects
+        repaired_ts = pd.to_datetime(repaired, errors="coerce")
+        converted = converted.copy()
+        converted.loc[still_missing] = repaired_ts
+
+    # Drop timezone if any
+    try:
+        if getattr(converted.dt, "tz", None) is not None:
+            converted = converted.dt.tz_localize(None)
+    except (TypeError, AttributeError, ValueError):
+        pass
+
+    return converted
+
+
 def _process_sheet(
     df: pd.DataFrame, start: date, end: date
 ) -> tuple[int, int, str | None]:
@@ -236,24 +267,32 @@ def _process_sheet(
     if not kayit_col:
         return 0, 0, "kayit_sutunu_yok"
 
-    uye = 0
-    yat = 0
+    kayit = _series_to_datetime(df[kayit_col])
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
 
-    kayit_series = df[kayit_col]
-    yatirim_series = df[yatirim_col] if yatirim_col else None
+    in_range = kayit.notna() & (kayit >= start_ts) & (kayit <= end_ts)
+    uye = int(in_range.sum())
+    if uye == 0:
+        return 0, 0, None if yatirim_col else "yatirim_sutunu_yok"
 
-    for idx in range(len(df)):
-        kayit = _parse_datetime(kayit_series.iloc[idx])
-        if kayit is None:
-            continue
-        kayit_day = kayit.date()
-        if kayit_day < start or kayit_day > end:
-            continue
-        uye += 1
-        yatirim = _parse_datetime(yatirim_series.iloc[idx]) if yatirim_series is not None else None
-        yat += _yatirim_sayisi(kayit, yatirim)
+    if not yatirim_col:
+        return uye, 0, "yatirim_sutunu_yok"
 
-    return uye, yat, None if yatirim_col else "yatirim_sutunu_yok"
+    yatirim = _series_to_datetime(df[yatirim_col])
+    # deadline = kayıt günü 00:00 + 1 gün + 10:00
+    deadline = kayit.dt.normalize() + pd.Timedelta(days=1, hours=10)
+    kayit_day = kayit.dt.normalize()
+    yatirim_day = yatirim.dt.normalize()
+
+    yat_mask = (
+        in_range
+        & yatirim.notna()
+        & (yatirim_day >= kayit_day)
+        & (yatirim <= deadline)
+    )
+    yat = int(yat_mask.sum())
+    return uye, yat, None
 
 
 def process_excel(

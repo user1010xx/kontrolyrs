@@ -4,11 +4,13 @@ import os
 import shutil
 import sys
 import tempfile
+import time
+from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.error import Conflict
+from telegram import InputFile, Update
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,6 +19,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from excel_processor import ProcessResult, parse_date_input, process_excel
 
@@ -42,6 +45,13 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "20")) * 1024 * 1024
 MAX_ROWS_PER_SHEET = int(os.getenv("MAX_ROWS_PER_SHEET", "100000"))
 CONVERSATION_TIMEOUT_SEC = int(os.getenv("CONVERSATION_TIMEOUT_SEC", "900"))  # 15 dk
 ALLOWED_EXTENSIONS = (".xlsx", ".xlsm")
+
+# Telegram HTTP timeouts (default ~5s causes "Timed out" on big Excel / slow hosts)
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "30"))
+HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "120"))
+HTTP_WRITE_TIMEOUT = float(os.getenv("HTTP_WRITE_TIMEOUT", "120"))
+HTTP_POOL_TIMEOUT = float(os.getenv("HTTP_POOL_TIMEOUT", "30"))
+SEND_RETRIES = int(os.getenv("SEND_RETRIES", "3"))
 
 
 def _is_allowed(update: Update) -> bool:
@@ -205,6 +215,7 @@ async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return WAITING_DATES
 
     await update.message.reply_text("Dosya işleniyor, lütfen bekleyin...")
+    t0 = time.perf_counter()
 
     try:
         loop = asyncio.get_running_loop()
@@ -217,6 +228,14 @@ async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 include_zero_rows=True,
                 max_rows_per_sheet=MAX_ROWS_PER_SHEET,
             ),
+        )
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "Excel islendi: %.1fs, personel=%s, uye=%s, yat=%s",
+            elapsed,
+            result.personel_count,
+            result.total_uye,
+            result.total_yat,
         )
         out_name = (
             f"rapor_{start_d.strftime('%d.%m.%Y')}_{end_d.strftime('%d.%m.%Y')}.xlsx"
@@ -236,31 +255,93 @@ async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         if len(caption) > 1024:
             caption = caption[:1021] + "..."
 
-        result.output.seek(0)
-        await update.message.reply_document(
-            document=result.output,
+        # BytesIO'yu kopyala; her denemede baştan okunabilsin
+        payload = result.output.getvalue()
+        await _send_document_with_retry(
+            update,
+            payload=payload,
             filename=out_name,
             caption=caption,
         )
         # Uzun uyarıları ayrı mesajda da gönder
         for w in result.warnings:
             if len(w) > 50:
-                await update.message.reply_text(f"⚠️ {w[:3500]}")
+                try:
+                    await update.message.reply_text(
+                        f"⚠️ {w[:3500]}",
+                        read_timeout=HTTP_READ_TIMEOUT,
+                        write_timeout=HTTP_WRITE_TIMEOUT,
+                        connect_timeout=HTTP_CONNECT_TIMEOUT,
+                    )
+                except (TimedOut, NetworkError):
+                    logger.warning("Uyari mesaji gonderilemedi: %s", w[:80])
+    except (TimedOut, NetworkError) as exc:
+        logger.exception("Telegram ag/timeout hatasi")
+        try:
+            await update.message.reply_text(
+                "İşlem tamamlandı ancak Telegram bağlantısı zaman aşımına uğradı.\n"
+                "Lütfen /yukle ile tekrar deneyin. Dosya çok büyükse biraz bekleyip yeniden gönderin.\n"
+                f"Detay: {type(exc).__name__}",
+                read_timeout=HTTP_READ_TIMEOUT,
+                write_timeout=HTTP_WRITE_TIMEOUT,
+                connect_timeout=HTTP_CONNECT_TIMEOUT,
+            )
+        except Exception:
+            pass
     except Exception as exc:
         logger.exception("Excel işleme hatası")
         detail = str(exc).strip() or type(exc).__name__
         if len(detail) > 300:
             detail = detail[:297] + "..."
-        await update.message.reply_text(
-            "Dosya işlenirken hata oluştu.\n"
-            f"Detay: {detail}\n\n"
-            "Kontrol edin: sheet'lerde 'KAYIT TARİHİ' ve 'İLK YATIRIM TARİHİ' sütunları, "
-            "tarih formatı (GG.AA.YYYY)."
-        )
+        try:
+            await update.message.reply_text(
+                "Dosya işlenirken hata oluştu.\n"
+                f"Detay: {detail}\n\n"
+                "Kontrol edin: sheet'lerde 'KAYIT TARİHİ' ve 'İLK YATIRIM TARİHİ' sütunları, "
+                "tarih formatı (GG.AA.YYYY).",
+                read_timeout=HTTP_READ_TIMEOUT,
+                write_timeout=HTTP_WRITE_TIMEOUT,
+                connect_timeout=HTTP_CONNECT_TIMEOUT,
+            )
+        except Exception:
+            pass
     finally:
         _cleanup(context)
 
     return ConversationHandler.END
+
+
+async def _send_document_with_retry(
+    update: Update,
+    *,
+    payload: bytes,
+    filename: str,
+    caption: str,
+) -> None:
+    last_exc: Exception | None = None
+    for attempt in range(1, SEND_RETRIES + 1):
+        try:
+            await update.message.reply_document(
+                document=InputFile(BytesIO(payload), filename=filename),
+                caption=caption,
+                read_timeout=HTTP_READ_TIMEOUT,
+                write_timeout=HTTP_WRITE_TIMEOUT,
+                connect_timeout=HTTP_CONNECT_TIMEOUT,
+                pool_timeout=HTTP_POOL_TIMEOUT,
+            )
+            return
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            logger.warning(
+                "Rapor gonderimi deneme %s/%s basarisiz: %s",
+                attempt,
+                SEND_RETRIES,
+                exc,
+            )
+            if attempt < SEND_RETRIES:
+                await asyncio.sleep(1.5 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -331,7 +412,27 @@ def main() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-    app = Application.builder().token(TOKEN).build()
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=HTTP_CONNECT_TIMEOUT,
+        read_timeout=HTTP_READ_TIMEOUT,
+        write_timeout=HTTP_WRITE_TIMEOUT,
+        pool_timeout=HTTP_POOL_TIMEOUT,
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=HTTP_CONNECT_TIMEOUT,
+        read_timeout=max(HTTP_READ_TIMEOUT, 60.0),
+        write_timeout=HTTP_WRITE_TIMEOUT,
+        pool_timeout=HTTP_POOL_TIMEOUT,
+    )
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("yukle", yukle)],
