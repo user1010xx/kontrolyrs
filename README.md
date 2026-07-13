@@ -4,33 +4,55 @@ Telegram uzerinden Excel dosyasi yukleyip personel bazli uye ve yatirim adetleri
 
 ## Komutlar
 
-- `/start` - Hos geldin mesaji
-- `/yukle` - Excel yukleme ve rapor alma
-- `/iptal` - Aktif islemi iptal etme
+- `/start` — Hos geldin / aktif islemi sifirlar
+- `/yukle` — Excel yukleme ve rapor alma
+- `/iptal` — Aktif islemi iptal etme
+- `/help` — Kullanim ozeti
 
 ## Yerel calistirma
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
+# Windows: copy .env.example .env
+# Linux/macOS: cp .env.example .env
 # .env dosyasina TELEGRAM_BOT_TOKEN degerini yazin
 python bot.py
 ```
 
-Windows icin: `start_bot.bat` veya `python run_bot.py`
+Windows icin: `start_bot.bat`, `start_bot.ps1` veya `python run_bot.py`
+
+### Ortam degiskenleri
+
+| Degisken | Aciklama |
+|----------|----------|
+| `TELEGRAM_BOT_TOKEN` | Zorunlu — BotFather token |
+| `ALLOWED_USER_IDS` | Opsiyonel — virgulle user ID; bos = herkese acik |
+| `MAX_FILE_MB` | Varsayilan 20 |
+| `MAX_ROWS_PER_SHEET` | Varsayilan 100000 |
+| `CONVERSATION_TIMEOUT_SEC` | Varsayilan 900 (15 dk) |
 
 ## Railway deploy
 
 1. Bu repoyu Railway'e baglayin
 2. **Variables** bolumune ekleyin:
    - `TELEGRAM_BOT_TOKEN` = BotFather token
-3. Deploy baslatilir; `python bot.py` komutu ile worker olarak calisir
-4. Ayni token ile baska yerde bot calistirmayin (409 Conflict olur)
+   - (onerilir) `ALLOWED_USER_IDS` = yetkili Telegram ID'ler
+3. Deploy baslatilir; `python bot.py` worker olarak calisir
+4. **Tek replica** kullanin; ayni token ile baska yerde bot calistirmayin (409 Conflict)
 
 ## Excel mantigi
 
 - Her personel ayri sheet'te
-- **Uye Adedi:** `KAYIT TARİHİ` (E) secilen tarih araliginda
-- **Yatirim Adedi:** `İLK YATIRIM TARİHİ` (F), kayit tarihinin ertesi gunu saat 10:00'a kadar
+- `TOPLAM` / `MANUEL EKLENENLER` (buyuk/kucuk harf duyarsiz) atlanir
+- **Uye Adedi:** `KAYIT TARİHİ` (veya benzer baslik) secilen tarih araliginda
+- **Yatirim Adedi:** `İLK YATIRIM TARİHİ`, kayit anindan itibaren **ertesi gun 10:00'a kadar** (dahil); kayittan onceki yatirim sayilmaz
 
 Tarih ornegi: `02.07.2026,04.07.2026` (baslangic ve bitis dahil)
+
+Desteklenen tarih ornekleri: `04.07.2026 10:57`, saniyeli, ISO (`2026-07-04T10:57:00`), Excel seri numarasi, bos hucre (NaT guvenli)
+
+## Test
+
+```bash
+python -m unittest discover -s tests -v
+```

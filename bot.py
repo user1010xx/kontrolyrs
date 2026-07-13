@@ -1,11 +1,11 @@
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-import pandas as pd
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import Conflict
@@ -18,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-from excel_processor import parse_date_input, process_excel
+from excel_processor import ProcessResult, parse_date_input, process_excel
 
 load_dotenv()
 
@@ -31,30 +31,115 @@ logger = logging.getLogger(__name__)
 WAITING_FILE, WAITING_DATES = range(2)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# Optional: comma-separated Telegram user IDs. Empty = allow everyone.
+_ALLOWED_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
+ALLOWED_USER_IDS: set[int] = {
+    int(x.strip()) for x in _ALLOWED_RAW.split(",") if x.strip().isdigit()
+}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# Limits
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "20")) * 1024 * 1024
+MAX_ROWS_PER_SHEET = int(os.getenv("MAX_ROWS_PER_SHEET", "100000"))
+CONVERSATION_TIMEOUT_SEC = int(os.getenv("CONVERSATION_TIMEOUT_SEC", "900"))  # 15 dk
+ALLOWED_EXTENSIONS = (".xlsx", ".xlsm")
+
+
+def _is_allowed(update: Update) -> bool:
+    if not ALLOWED_USER_IDS:
+        return True
+    user = update.effective_user
+    return bool(user and user.id in ALLOWED_USER_IDS)
+
+
+async def _deny(update: Update) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Bu botu kullanma yetkiniz yok. Yöneticinizle iletişime geçin."
+        )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_allowed(update):
+        await _deny(update)
+        return ConversationHandler.END
+
+    _cleanup(context)
     await update.message.reply_text(
         "Merhaba! Personel satış raporu botuna hoş geldiniz.\n\n"
-        "Rapor almak için /yukle komutunu kullanın."
+        "Komutlar:\n"
+        "/yukle — Excel yükle ve rapor al\n"
+        "/iptal — Aktif işlemi iptal et\n"
+        "/help — Yardım"
     )
+    return ConversationHandler.END
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_allowed(update):
+        await _deny(update)
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Kullanım:\n"
+        "1) /yukle\n"
+        "2) Excel dosyasını (.xlsx / .xlsm) doküman olarak gönderin\n"
+        "3) Tarih aralığını yazın: 02.07.2026,04.07.2026\n\n"
+        "Üye: KAYIT TARİHİ seçilen aralıkta\n"
+        "Yatırım: İLK YATIRIM, kayıt anı ≤ yatırım ≤ ertesi gün 10:00\n\n"
+        "/iptal ile işlemi iptal edebilirsiniz."
+    )
+    # Conversation içinde state koru
+    if context.user_data.get("excel_path"):
+        return WAITING_DATES
+    if context.user_data.get("temp_dir") or context.user_data.get("_awaiting_file"):
+        return WAITING_FILE
+    return ConversationHandler.END
 
 
 async def yukle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("Lütfen Excel dosyasını gönderin.")
+    if not _is_allowed(update):
+        await _deny(update)
+        return ConversationHandler.END
+
+    # Önceki temp dosyaları sil (clear() sızıntı yapmasın)
+    _cleanup(context)
+    context.user_data["_awaiting_file"] = True
+    await update.message.reply_text(
+        "Lütfen Excel dosyasını gönderin (.xlsx veya .xlsm, doküman olarak)."
+    )
     return WAITING_FILE
 
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_allowed(update):
+        await _deny(update)
+        return ConversationHandler.END
+
     document = update.message.document
     if not document:
-        await update.message.reply_text("Lütfen bir Excel dosyası gönderin (.xlsx).")
+        await update.message.reply_text(
+            "Lütfen bir Excel dosyasını doküman olarak gönderin (.xlsx / .xlsm)."
+        )
         return WAITING_FILE
 
-    filename = document.file_name or ""
-    if not filename.lower().endswith((".xlsx", ".xlsm")):
-        await update.message.reply_text("Sadece Excel dosyası (.xlsx) kabul edilir.")
+    raw_name = document.file_name or "dosya.xlsx"
+    filename = Path(raw_name).name  # path traversal engeli
+    lower = filename.lower()
+    if not lower.endswith(ALLOWED_EXTENSIONS):
+        await update.message.reply_text(
+            "Sadece Excel dosyası kabul edilir: .xlsx veya .xlsm"
+        )
         return WAITING_FILE
+
+    file_size = document.file_size or 0
+    if file_size > MAX_FILE_BYTES:
+        mb = MAX_FILE_BYTES // (1024 * 1024)
+        await update.message.reply_text(
+            f"Dosya çok büyük (max {mb} MB). Daha küçük bir dosya gönderin."
+        )
+        return WAITING_FILE
+
+    # Önceki dosyayı temizle, yenisini kaydet
+    _cleanup(context)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="etkinlik_"))
     file_path = temp_dir / filename
@@ -64,34 +149,57 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except Exception:
         logger.exception("Dosya indirme hatasi")
         _cleanup_dir(temp_dir)
-        await update.message.reply_text("Dosya indirilemedi. Lutfen tekrar deneyin.")
+        await update.message.reply_text("Dosya indirilemedi. Lütfen tekrar deneyin.")
         return WAITING_FILE
 
     context.user_data["excel_path"] = str(file_path)
     context.user_data["temp_dir"] = str(temp_dir)
+    context.user_data.pop("_awaiting_file", None)
 
     await update.message.reply_text(
         "Dosya alındı.\n\n"
         "Kontrol edilecek tarih aralığını yazın.\n"
         "Örnek: 02.07.2026,04.07.2026\n"
-        "(Başlangıç ve bitiş tarihleri dahil)"
+        "(Başlangıç ve bitiş tarihleri dahil)\n\n"
+        "İptal için /iptal"
     )
     return WAITING_DATES
 
 
 async def wrong_input_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Lutfen Excel dosyasini (.xlsx) dokuman olarak gonderin.")
+    await update.message.reply_text(
+        "Lütfen Excel dosyasını (.xlsx / .xlsm) Telegram'da *dosya/doküman* olarak gönderin.\n"
+        "Fotoğraf veya metin kabul edilmez.",
+        parse_mode=None,
+    )
     return WAITING_FILE
 
 
+async def wrong_input_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Şu an tarih aralığı bekleniyor.\n"
+        "Örnek: 02.07.2026,04.07.2026\n"
+        "İptal: /iptal — Yeni dosya: /yukle"
+    )
+    return WAITING_DATES
+
+
 async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_allowed(update):
+        await _deny(update)
+        _cleanup(context)
+        return ConversationHandler.END
+
     excel_path = context.user_data.get("excel_path")
-    if not excel_path:
-        await update.message.reply_text("Oturum süresi doldu. Lütfen /yukle ile tekrar başlayın.")
+    if not excel_path or not Path(excel_path).is_file():
+        _cleanup(context)
+        await update.message.reply_text(
+            "Oturum süresi doldu veya dosya bulunamadı. Lütfen /yukle ile tekrar başlayın."
+        )
         return ConversationHandler.END
 
     try:
-        start, end = parse_date_input(update.message.text)
+        start_d, end_d = parse_date_input(update.message.text or "")
     except ValueError as exc:
         await update.message.reply_text(f"Hatalı tarih: {exc}")
         return WAITING_DATES
@@ -99,24 +207,56 @@ async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("Dosya işleniyor, lütfen bekleyin...")
 
     try:
-        output = process_excel(excel_path, start, end)
-        out_name = f"rapor_{start.strftime('%d.%m.%Y')}_{end.strftime('%d.%m.%Y')}.xlsx"
-        summary = pd.read_excel(output)
-        output.seek(0)
-        total_uye = int(summary["Üye Adedi"].sum())
-        total_yat = int(summary["Yatırım Adedi"].sum())
-        caption = (
-            f"Tarih araligi: {start.strftime('%d.%m.%Y')} - {end.strftime('%d.%m.%Y')} (dahil)\n"
-            f"Toplam: {total_uye} uye, {total_yat} yatirim"
+        loop = asyncio.get_running_loop()
+        result: ProcessResult = await loop.run_in_executor(
+            None,
+            lambda: process_excel(
+                excel_path,
+                start_d,
+                end_d,
+                include_zero_rows=True,
+                max_rows_per_sheet=MAX_ROWS_PER_SHEET,
+            ),
         )
+        out_name = (
+            f"rapor_{start_d.strftime('%d.%m.%Y')}_{end_d.strftime('%d.%m.%Y')}.xlsx"
+        )
+        caption_lines = [
+            f"Tarih aralığı: {start_d.strftime('%d.%m.%Y')} - {end_d.strftime('%d.%m.%Y')} (dahil)",
+            f"Toplam: {result.total_uye} üye, {result.total_yat} yatırım",
+            f"Personel: {result.personel_count}",
+        ]
+        if result.warnings:
+            # Telegram caption max ~1024
+            warn_text = " | ".join(result.warnings)
+            if len(warn_text) > 400:
+                warn_text = warn_text[:397] + "..."
+            caption_lines.append(f"Uyarı: {warn_text}")
+        caption = "\n".join(caption_lines)
+        if len(caption) > 1024:
+            caption = caption[:1021] + "..."
+
+        result.output.seek(0)
         await update.message.reply_document(
-            document=output,
+            document=result.output,
             filename=out_name,
             caption=caption,
         )
-    except Exception:
+        # Uzun uyarıları ayrı mesajda da gönder
+        for w in result.warnings:
+            if len(w) > 50:
+                await update.message.reply_text(f"⚠️ {w[:3500]}")
+    except Exception as exc:
         logger.exception("Excel işleme hatası")
-        await update.message.reply_text("Dosya işlenirken hata oluştu. Dosya formatını kontrol edin.")
+        detail = str(exc).strip() or type(exc).__name__
+        if len(detail) > 300:
+            detail = detail[:297] + "..."
+        await update.message.reply_text(
+            "Dosya işlenirken hata oluştu.\n"
+            f"Detay: {detail}\n\n"
+            "Kontrol edin: sheet'lerde 'KAYIT TARİHİ' ve 'İLK YATIRIM TARİHİ' sütunları, "
+            "tarih formatı (GG.AA.YYYY)."
+        )
     finally:
         _cleanup(context)
 
@@ -125,31 +265,61 @@ async def receive_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _cleanup(context)
-    await update.message.reply_text("İşlem iptal edildi.")
+    if update.effective_message:
+        await update.effective_message.reply_text("İşlem iptal edildi.")
+    return ConversationHandler.END
+
+
+async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _cleanup(context)
+    msg = update.effective_message if update else None
+    if msg:
+        await msg.reply_text(
+            "Oturum zaman aşımına uğradı (dosya/tarih beklenirken işlem yok).\n"
+            "Tekrar başlamak için /yukle"
+        )
     return ConversationHandler.END
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
         logger.error(
-            "Baska bir bot ornegi calisiyor. Once onu durdurun, sonra tekrar baslatin."
+            "Başka bir bot örneği çalışıyor (409 Conflict). "
+            "Tek instance bırakın. Process kapatılıyor; çift instance döngüsünü önlemek için "
+            "Railway'de tek replica kullanın."
         )
-        await context.application.stop()
+        # stop polling; exit non-zero only if env asks (default: stop cleanly)
+        try:
+            await context.application.stop()
+        except Exception:
+            logger.exception("Conflict sonrası stop başarısız")
         return
     logger.exception("Beklenmeyen hata", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Beklenmeyen bir hata oluştu. /yukle ile tekrar deneyin."
+            )
+        except Exception:
+            pass
 
 
 def _cleanup_dir(temp_dir: str | Path | None) -> None:
     if not temp_dir:
         return
-    for path in Path(temp_dir).glob("*"):
-        path.unlink(missing_ok=True)
-    Path(temp_dir).rmdir()
+    path = Path(temp_dir)
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        logger.exception("Temp dizin silinemedi: %s", path)
 
 
 def _cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
     temp_dir = context.user_data.pop("temp_dir", None)
     context.user_data.pop("excel_path", None)
+    context.user_data.pop("_awaiting_file", None)
     _cleanup_dir(temp_dir)
 
 
@@ -162,23 +332,49 @@ def main() -> None:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(TOKEN).build()
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("yukle", yukle)],
         states={
             WAITING_FILE: [
                 MessageHandler(filters.Document.ALL, receive_file),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, wrong_input_file),
+                MessageHandler(~filters.COMMAND, wrong_input_file),
             ],
-            WAITING_DATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_dates)],
+            WAITING_DATES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_dates),
+                MessageHandler(~filters.COMMAND, wrong_input_dates),
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, conversation_timeout),
+            ],
         },
-        fallbacks=[CommandHandler("iptal", cancel), CommandHandler("yukle", yukle)],
+        fallbacks=[
+            CommandHandler("iptal", cancel),
+            CommandHandler("yukle", yukle),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+        ],
+        conversation_timeout=CONVERSATION_TIMEOUT_SEC,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(conv)
     app.add_error_handler(on_error)
 
-    logger.info("Bot başlatılıyor...")
+    if ALLOWED_USER_IDS:
+        logger.info("Yetkili kullanıcı sayısı: %s", len(ALLOWED_USER_IDS))
+    else:
+        logger.warning(
+            "ALLOWED_USER_IDS boş — bot herkese açık. .env ile kısıtlamayı düşünün."
+        )
+
+    logger.info(
+        "Bot başlatılıyor (timeout=%ss, max_file=%sMB)...",
+        CONVERSATION_TIMEOUT_SEC,
+        MAX_FILE_BYTES // (1024 * 1024),
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
