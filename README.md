@@ -39,6 +39,11 @@ Windows icin: `start_bot.bat`, `start_bot.ps1` veya `python run_bot.py`
    - (onerilir) `ALLOWED_USER_IDS` = yetkili Telegram ID'ler
 3. Deploy baslatilir; `python bot.py` worker olarak calisir
 4. **Tek replica** kullanin; ayni token ile baska yerde bot calistirmayin (409 Conflict)
+5. Yerel `python bot.py` / `run_bot.py` calisiyorsa **kapatin** — aksi halde Railway mesaj alamaz
+6. Deploy loglarinda sunlari arayin:
+   - `Bot oturum acildi: @yarismakt_bot` (dogru bot mu?)
+   - `Update: chat=... text='/start'` (mesaj geliyor mu?)
+   - `409 Conflict` varsa baska instance token'i kullaniyor
 
 ## Excel mantigi
 

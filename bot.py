@@ -17,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -30,6 +31,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Token'ı URL içinde basmasın; getUpdates gürültüsünü kes
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.INFO)
 
 WAITING_FILE, WAITING_DATES = range(2)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -365,16 +371,17 @@ async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYP
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
         logger.error(
-            "Başka bir bot örneği çalışıyor (409 Conflict). "
-            "Tek instance bırakın. Process kapatılıyor; çift instance döngüsünü önlemek için "
-            "Railway'de tek replica kullanın."
+            "409 Conflict: ayni TELEGRAM_BOT_TOKEN ile baska bir bot calisiyor "
+            "(yerel PC, ikinci Railway servisi, eski deploy). "
+            "Digerini kapatin. Process 1 sn sonra cikiyor."
         )
-        # stop polling; exit non-zero only if env asks (default: stop cleanly)
         try:
             await context.application.stop()
         except Exception:
             logger.exception("Conflict sonrası stop başarısız")
-        return
+        # Railway'in restart etmesi / logda net gorunmesi icin
+        await asyncio.sleep(1)
+        os._exit(1)
     logger.exception("Beklenmeyen hata", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
@@ -383,6 +390,45 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:
             pass
+
+
+async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Her update'i logla — Railway'de 'mesaj geliyor mu?' teshisi icin."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = ""
+    if msg is not None:
+        text = (msg.text or msg.caption or "")[:120]
+        if msg.document:
+            text = f"[document:{msg.document.file_name}] {text}"
+    logger.info(
+        "Update: chat=%s user=%s (@%s) text=%r",
+        chat.id if chat else None,
+        user.id if user else None,
+        getattr(user, "username", None),
+        text,
+    )
+
+
+async def post_init(application: Application) -> None:
+    me = await application.bot.get_me()
+    logger.info("Bot oturum acildi: @%s id=%s", me.username, me.id)
+
+    info = await application.bot.get_webhook_info()
+    if info.url:
+        logger.warning(
+            "Webhook tanimli (%s) — long polling icin siliniyor.",
+            info.url,
+        )
+        await application.bot.delete_webhook(drop_pending_updates=False)
+    else:
+        logger.info("Webhook yok; long polling kullanilacak.")
+
+    if ALLOWED_USER_IDS:
+        logger.info("ALLOWED_USER_IDS aktif: %s kullanici", len(ALLOWED_USER_IDS))
+    else:
+        logger.warning("ALLOWED_USER_IDS bos — bot herkese acik.")
 
 
 def _cleanup_dir(temp_dir: str | Path | None) -> None:
@@ -408,9 +454,11 @@ def main() -> None:
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN bulunamadı. .env dosyasını kontrol edin.")
 
+    token_preview = f"...{TOKEN[-6:]}" if len(TOKEN) > 6 else "(kisa)"
+    logger.info("TELEGRAM_BOT_TOKEN yuklendi (%s)", token_preview)
+
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.set_event_loop(asyncio.new_event_loop())
 
     request = HTTPXRequest(
         connection_pool_size=8,
@@ -419,10 +467,11 @@ def main() -> None:
         write_timeout=HTTP_WRITE_TIMEOUT,
         pool_timeout=HTTP_POOL_TIMEOUT,
     )
+    # Long-poll getUpdates: read timeout polling suresinden uzun olmali
     get_updates_request = HTTPXRequest(
         connection_pool_size=4,
         connect_timeout=HTTP_CONNECT_TIMEOUT,
-        read_timeout=max(HTTP_READ_TIMEOUT, 60.0),
+        read_timeout=max(HTTP_READ_TIMEOUT, 75.0),
         write_timeout=HTTP_WRITE_TIMEOUT,
         pool_timeout=HTTP_POOL_TIMEOUT,
     )
@@ -431,52 +480,65 @@ def main() -> None:
         .token(TOKEN)
         .request(request)
         .get_updates_request(get_updates_request)
+        .post_init(post_init)
         .build()
     )
 
+    # conversation_timeout JobQueue ister; yoksa timeout'u kapat (entry/handlers calissin)
+    use_timeout = CONVERSATION_TIMEOUT_SEC if app.job_queue is not None else None
+    if use_timeout is None and CONVERSATION_TIMEOUT_SEC:
+        logger.warning(
+            "JobQueue yok — conversation_timeout devre disi. "
+            "requirements: python-telegram-bot[job-queue]"
+        )
+
+    states: dict = {
+        WAITING_FILE: [
+            MessageHandler(filters.Document.ALL, receive_file),
+            MessageHandler(~filters.COMMAND, wrong_input_file),
+        ],
+        WAITING_DATES: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_dates),
+            MessageHandler(~filters.COMMAND, wrong_input_dates),
+        ],
+    }
+    if use_timeout is not None:
+        states[ConversationHandler.TIMEOUT] = [
+            MessageHandler(filters.ALL, conversation_timeout),
+            CommandHandler("iptal", cancel),
+        ]
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("yukle", yukle)],
-        states={
-            WAITING_FILE: [
-                MessageHandler(filters.Document.ALL, receive_file),
-                MessageHandler(~filters.COMMAND, wrong_input_file),
-            ],
-            WAITING_DATES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_dates),
-                MessageHandler(~filters.COMMAND, wrong_input_dates),
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, conversation_timeout),
-            ],
-        },
+        states=states,
         fallbacks=[
             CommandHandler("iptal", cancel),
             CommandHandler("yukle", yukle),
             CommandHandler("start", start),
             CommandHandler("help", help_cmd),
         ],
-        conversation_timeout=CONVERSATION_TIMEOUT_SEC,
+        conversation_timeout=use_timeout,
         allow_reentry=True,
     )
 
+    # group=-1: once logla (yanit vermese bile mesaj geldi mi gorunur)
+    app.add_handler(TypeHandler(Update, log_incoming), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(conv)
     app.add_error_handler(on_error)
 
-    if ALLOWED_USER_IDS:
-        logger.info("Yetkili kullanıcı sayısı: %s", len(ALLOWED_USER_IDS))
-    else:
-        logger.warning(
-            "ALLOWED_USER_IDS boş — bot herkese açık. .env ile kısıtlamayı düşünün."
-        )
-
     logger.info(
-        "Bot başlatılıyor (timeout=%ss, max_file=%sMB)...",
-        CONVERSATION_TIMEOUT_SEC,
+        "Bot baslatiliyor (conv_timeout=%s, max_file=%sMB)...",
+        use_timeout,
         MAX_FILE_BYTES // (1024 * 1024),
     )
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # drop_pending_updates=False: deploy sirasinda gonderilen /start kaybolmasin
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        bootstrap_retries=5,
+    )
 
 
 if __name__ == "__main__":
